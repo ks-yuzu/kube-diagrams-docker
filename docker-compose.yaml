@@ -1,0 +1,10 @@
+services:
+  kube-diagrams:
+    image: ghcr.io/ks-yuzu/kube-diagrams:latest
+    container_name: kube-diagrams
+    volumes:
+    - /tmp/kube-diagrams:/work
+    - ./conf/config.kdc.yaml:/tmp/config.kdc.yaml
+    stdin_open: true
+    command: >
+      kube-diagrams -c /tmp/config.kdc.yaml -o all.png -

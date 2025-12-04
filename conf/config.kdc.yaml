@@ -1,0 +1,573 @@
+# Configuration of kube-diagrams
+clusters:
+  # - label: argocd.argoproj.io/instance
+  #   title: "ArgoCD Application: {}"
+  #   recommended: true
+  #   graph_attr:
+  #     bgcolor: "#FDEEE3"
+  - label: app.kubernetes.io/part-of
+    title: "K8s Part of: {}"
+    recommended: true
+    graph_attr:
+      bgcolor: "#FDEEE3"
+  - label: helm.sh/chart
+    title: "Helm Chart: {}"
+    recommended: true
+    graph_attr:
+      bgcolor: "#EBF3E7"
+  - label: chart
+    title: "Chart: {}"
+    recommended: false
+    graph_attr:
+      bgcolor: "#EBF3E7"
+  - label: release
+    title: "Release: {}"
+    recommended: false
+    graph_attr:
+      bgcolor: "#E5F5FD"
+  - label: app.kubernetes.io/component
+    title: "K8s Component: {}"
+    recommended: true
+    graph_attr:
+      bgcolor: "#FDF7E3"
+  - label: component
+    title: "Component: {}"
+    recommended: false
+    graph_attr:
+      bgcolor: "#FDF7E3"
+  - label: app.kubernetes.io/name
+    title: "K8s Application: {}"
+    recommended: true
+    graph_attr:
+      bgcolor: "#ECE8F6"
+  # - label: app
+  #   title: "Application: {}  !! Use app.kubernetes.io/name instead !!"
+  #   recommended: false
+  #   graph_attr:
+  #     bgcolor: "#ECE8F6"
+  - label: app.kubernetes.io/instance
+    title: "K8s Instance: {}"
+    recommended: true
+    graph_attr:
+      bgcolor: "#E5F5FD"
+  - label: tier
+    title: "Tier: {}"
+    recommended: false
+    graph_attr:
+      bgcolor: "#ECE8F6"
+  - label: service
+    title: "Microservice: {}"
+    recommended: false
+    graph_attr:
+      bgcolor: "#FDF7E3"
+  - label: rbac.authorization.k8s.io/aggregate-to-admin
+    title: "Admin ClusterRole Aggregation"
+    recommended: true
+    graph_attr:
+      bgcolor: transparent
+  - label: rbac.authorization.k8s.io/aggregate-to-edit
+    title: "Edit ClusterRole Aggregation"
+    recommended: true
+    graph_attr:
+      bgcolor: transparent
+  - label: rbac.authorization.k8s.io/aggregate-to-view
+    title: "View ClusterRole Aggregation"
+    recommended: true
+    graph_attr:
+      bgcolor: transparent
+  - annotation: helm.sh/hook
+    title: "{}"
+    recommended: true
+    graph_attr:
+      bgcolor: "#EBF3E7"
+      style: dotted,rounded
+
+nodes:
+  #
+  # Builtin Resources
+  #
+  ### visibility
+  Job/batch/v1:
+    show: false
+  ReplicaSet/apps/v1:
+    show: false
+
+  Deployment/apps/v1:
+    # scope: Namespaced
+    # diagram_node_classname: diagrams.k8s.compute.Deploy
+    edges: |
+      #edges.add_owned_resources()
+      edges.add_service_account("spec.template.spec")
+      edges.add_all_volume_resources("spec.template.spec.volumes")
+      #edges.add_containers_env_value_from_and_env_from("spec.template.spec.containers")
+      #edges.add_containers_env_value_from_and_env_from("spec.template.spec.initContainers")
+      #edges.add_containers_env_value_from_and_env_from("spec.template.spec.ephemeralContainers")
+      edges.add_wait_for_services("spec.template.spec.initContainers")
+      edges.add_networks("spec.template.metadata.annotations")
+      edges.add_priority_class("spec.template.spec.priorityClassName")
+      edges.add_edge_to(
+        "spec.template.spec.runtimeClassName",
+        ".",
+        None,
+        "RuntimeClass",
+        "node.k8s.io/v1",
+        "REFERENCE"
+      )
+      for rs in edges.get_owned_resources(resource):
+        for pod in edges.get_owned_resources(rs):
+          edges.add_edge_to(
+            None,
+            pod["metadata"]["name"],
+            get_namespace(pod),
+            pod["kind"],
+            pod["apiVersion"],
+            "OWNER",
+          )
+
+  Service/v1:
+    # scope: Namespaced
+    # diagram_node_classname: diagrams.k8s.network.SVC
+    edges: |
+      #edges.add_edges_for_service()
+      # Service のポート情報から SELECTOR エッジのラベルを作る
+      labels = []
+      for service_port in query_path(resource, "spec.ports", []):
+          port = service_port.get("port")
+          target_port = service_port.get("targetPort")
+          protocol = service_port.get("protocol", "TCP")
+
+          if target_port is None or target_port == port:
+              label = f"{port}/{protocol}"
+          else:
+              label = f"{port}->{target_port}/{protocol}"
+
+          labels.append(label)
+
+      # デフォルト実装と同等の edge 設定（SELECTOR をベースに xlabel を追加）
+      edge_cfg = {
+          **get_edge_config("SELECTOR"),
+          "xlabel": "\n".join(labels),
+          "fontsize": "10",
+      }
+
+      svc_ns = get_namespace(resource)
+      selector = query_path(resource, "spec.selector", {}) or {}
+
+      # selector が空なら Pod にはつながない（ClusterIP None + Endpoints のみのパターンなど）
+      if isinstance(selector, dict) and selector:
+          for rid, res in resources.items():
+              # Pod 以外は無視
+              if res.get("kind") != "Pod":
+                  continue
+
+              # 同一 namespace の Pod に限定
+              if get_namespace(res) != svc_ns:
+                  continue
+
+              # Pod のラベルを取得
+              pod_labels = query_path(res, "metadata.labels", {}) or {}
+              if not isinstance(pod_labels, dict):
+                  continue
+
+              # Service の selector と完全一致するかチェック (equals マッチ)
+              matched = True
+              for k, v in selector.items():
+                  if pod_labels.get(k) != v:
+                      matched = False
+                      break
+
+              if not matched:
+                  continue
+
+              # 条件を満たす Pod にだけエッジを貼る
+              edges.add_edge_to(
+                  "spec.selector",          # tooltip 用の path
+                  get_name(res),            # Pod 名
+                  svc_ns,                   # Service と同じ namespace
+                  res.get("kind"),          # "Pod"
+                  res.get("apiVersion"),    # たとえば "v1"
+                  edge_cfg,
+              )
+
+      # ここから先は元々の add_edges_for_service と同じ Endpoints / EndpointSlice 処理
+
+      # EndpointSlice: Service 名ラベルでひも付け
+      edges.add_all_resources_matching_labels(
+          "EndpointSlice",
+          "endpoint_slice",
+          {
+              "kubernetes.io/service-name": query_path(resource, "metadata.name"),
+          },
+      )
+
+      # Endpoints リソースとの OWNER エッジ
+      endpoints_rid = (
+          f"{query_path(resource, 'metadata.name')}"
+          f"/{get_namespace(resource)}/Endpoints/v1"
+      )
+      if endpoints_rid in resources:
+          edges.add_edge("owns", [endpoints_rid, "OWNER"])
+
+
+  #
+  # Gateway
+  #
+  GatewayClass/gateway.networking.k8s.io/v1:
+    scope: Cluster
+    # 適当なアイコン。Ingressアイコンを流用しています
+    diagram_node_classname: diagrams.k8s.network.Ingress
+
+  Gateway/gateway.networking.k8s.io/v1:
+    scope: Namespaced
+    # diagram_node_classname: diagrams.k8s.network.Ingress
+    custom_icon: $KD/icons/Gateway-256.png
+    edges: |
+      # Gateway → GatewayClass
+      gc_name = query_path(edges.resource, "spec.gatewayClassName")
+      if gc_name:
+          edges.add_edge_to(
+              "spec.gatewayClassName",
+              gc_name,
+              None,  # Clusterスコープ
+              "GatewayClass",
+              "gateway.networking.k8s.io/v1",
+              "REFERENCE-UP",
+          )
+
+      # # Gateway → HTTPRoute（親として参照している Route を逆引き）
+      # my_namespace = edges.namespace
+      # my_name = get_name(edges.resource)
+
+      # for rid, resource in resources.items():
+      #     if resource.get("kind") != "HTTPRoute":
+      #         continue
+      #     if resource.get("apiVersion") != "gateway.networking.k8s.io/v1":
+      #         continue
+
+      #     parent_refs = query_path(resource, "spec.parentRefs", [])
+      #     if not isinstance(parent_refs, list):
+      #         continue
+
+      #     route_namespace = get_namespace(resource)
+
+      #     for parent in parent_refs:
+      #         if not isinstance(parent, dict):
+      #             continue
+
+      #         group = parent.get("group") or "gateway.networking.k8s.io"
+      #         kind = parent.get("kind") or "Gateway"
+      #         if group != "gateway.networking.k8s.io" or kind != "Gateway":
+      #             continue
+
+      #         name = parent.get("name")
+      #         if not name:
+      #             continue
+
+      #         # parentRef.namespace が省略された場合は Route の namespace がデフォルト
+      #         namespace = parent.get("namespace") or route_namespace
+
+      #         if name == my_name and namespace == my_namespace:
+      #             edges.add_edge_to_rid(
+      #                 "spec.parentRefs",
+      #                 rid,
+      #                 "REFERENCE",
+      #                 data=parent,
+      #             )
+      #             break
+
+  HTTPRoute/gateway.networking.k8s.io/v1:
+    scope: Namespaced
+    # diagram_node_classname: diagrams.k8s.network.Ingress
+    custom_icon: $KD/icons/HTTPRoute-256.png
+    edges: |
+      # HTTPRoute → Gateway（spec.parentRefs）
+      parent_refs = query_path(edges.resource, "spec.parentRefs", [])
+      if isinstance(parent_refs, list):
+          for parent in parent_refs:
+              if not isinstance(parent, dict):
+                  continue
+
+              group = parent.get("group") or "gateway.networking.k8s.io"
+              kind = parent.get("kind") or "Gateway"
+              if group != "gateway.networking.k8s.io" or kind != "Gateway":
+                  continue
+
+              name = parent.get("name")
+              if not name:
+                  continue
+
+              # parentRef.namespace が省略された場合は Route の namespace がデフォルト
+              namespace = parent.get("namespace") or edges.namespace
+
+              edges.add_edge_to(
+                  "spec.parentRefs",
+                  name,
+                  namespace,
+                  "Gateway",
+                  "gateway.networking.k8s.io/v1",
+                  "REFERENCE-UP",
+                  data=parent,
+              )
+
+      # HTTPRoute → Service（spec.rules[].backendRefs[]）
+      rules = query_path(edges.resource, "spec.rules", [])
+      if isinstance(rules, list):
+          for rule in rules:
+              backend_refs = rule.get("backendRefs", [])
+              if not isinstance(backend_refs, list):
+                  continue
+
+              for backend in backend_refs:
+                  if not isinstance(backend, dict):
+                      continue
+
+                  kind = backend.get("kind") or "Service"
+                  group = backend.get("group") or ""
+                  # デフォルト(kind=Service, group="") の Service のみ扱う
+                  if kind != "Service" or group not in ("", "core"):
+                      continue
+
+                  name = backend.get("name")
+                  if not name:
+                      continue
+
+                  # backendRef.namespace が省略された場合は Route の namespace がデフォルト
+                  namespace = backend.get("namespace") or edges.namespace
+
+                  edges.add_edge_to(
+                      "spec.rules[].backendRefs[]",
+                      name,
+                      namespace,
+                      "Service",
+                      "v1",
+                      "REFERENCE",
+                      data=backend,
+                  )
+
+
+  #
+  # GKE Gateway Custom Resources
+  #
+  # GCPBackendPolicy （GKE Gateway 用ポリシー）
+  GCPBackendPolicy/networking.gke.io/v1:
+    scope: Namespaced
+    # diagram_node_classname: diagrams.k8s.network.SVC
+    custom_icon: $KD/icons/GCPBackendPolicy-256.png
+    edges: |
+      target = query_path(edges.resource, "spec.targetRef")
+      if isinstance(target, dict):
+          group = target.get("group") or ""
+          kind = target.get("kind") or "Service"
+          name = target.get("name")
+          if not name:
+              pass
+          else:
+              # namespace 省略時はポリシーと同じ NS
+              ns = target.get("namespace") or edges.namespace
+
+              # 単一クラスタ: Service を指している場合
+              if kind == "Service" and group in ("", "core"):
+                  edges.add_edge_to(
+                      "spec.targetRef",
+                      name,
+                      ns,
+                      "Service",
+                      "v1",
+                      "REFERENCE",
+                      data=target,
+                  )
+
+              # マルチクラスタ構成で ServiceImport を使う場合は、必要に応じてコメントアウト解除
+              # elif kind == "ServiceImport" and group in ("multicluster.x-k8s.io", "net.gke.io"):
+              #     edges.add_edge_to(
+              #         "spec.targetRef",
+              #         name,
+              #         ns,
+              #         "ServiceImport",
+              #         target.get("apiVersion") or "multicluster.x-k8s.io/v1alpha1",
+              #         "REFERENCE",
+              #         data=target,
+              #     )
+
+  # HealthCheckPolicy （GKE Gateway 用ヘルスチェックポリシー）
+  HealthCheckPolicy/networking.gke.io/v1:
+    scope: Namespaced
+    # diagram_node_classname: diagrams.k8s.network.SVC
+    custom_icon: $KD/icons/HealthCheckPolicy-256.png
+    edges: |
+      target = query_path(edges.resource, "spec.targetRef")
+      if isinstance(target, dict):
+          group = target.get("group") or ""
+          kind = target.get("kind") or "Service"
+          name = target.get("name")
+          if not name:
+              pass
+          else:
+              ns = target.get("namespace") or edges.namespace
+
+              if kind == "Service" and group in ("", "core"):
+                  edges.add_edge_to(
+                      "spec.targetRef",
+                      name,
+                      ns,
+                      "Service",
+                      "v1",
+                      "REFERENCE",
+                      data=target,
+                  )
+
+              # 必要なら ServiceImport もサポート
+              # elif kind == "ServiceImport" and group in ("multicluster.x-k8s.io", "net.gke.io"):
+              #     edges.add_edge_to(
+              #         "spec.targetRef",
+              #         name,
+              #         ns,
+              #         "ServiceImport",
+              #         target.get("apiVersion") or "multicluster.x-k8s.io/v1alpha1",
+              #         "REFERENCE",
+              #         data=target,
+              #     )
+
+
+
+  #
+  # Prometheus Operator
+  #
+  ServiceMonitor/monitoring.coreos.com/v1:
+    scope: Namespaced
+    custom_icon: $KD/icons/ServiceMonitor-512.png
+    edges: |
+      edges.add_owned_resources()
+      if not edges.add_all_resources_matching_labels("Service", "spec.selector.matchLabels"):
+        edges.warning("spec.selector.matchLabels", f"No service matches metadata labels {query_path(resource, 'spec.selector.matchLabels')}")
+      #TODO: spec.namespaceSelector
+  PodMonitor/monitoring.coreos.com/v1:
+    scope: Namespaced
+    custom_icon: $KD/icons/PodMonitor-512.png
+    edges: |
+      # PodMonitor -> Pod (selector + namespaceSelector)
+      pm_ns = edges.namespace
+
+      selector = query_path(edges.resource, "spec.selector.matchLabels", {})
+      if not isinstance(selector, dict) or not selector:
+          pass
+      else:
+          ns_selector = query_path(edges.resource, "spec.namespaceSelector", {})
+          target_namespaces = {pm_ns}
+
+          if isinstance(ns_selector, dict) and ns_selector:
+              if ns_selector.get("any") is True:
+                  target_namespaces = None
+              else:
+                  match_names = ns_selector.get("matchNames")
+                  if isinstance(match_names, list) and match_names:
+                      target_namespaces = {
+                          n for n in match_names
+                          if isinstance(n, str)
+                      }
+
+          # Pod/v1 を総当りしてラベルマッチ & namespaceSelector を適用
+          for rid, res in resources.items():
+              if res.get("kind") != "Pod" or res.get("apiVersion") != "v1":
+                  continue
+
+              pod_ns = get_namespace(res)
+              if target_namespaces is not None and pod_ns not in target_namespaces:
+                  continue
+
+              labels = query_path(res, "metadata.labels", {})
+              if not isinstance(labels, dict):
+                  continue
+
+              matched = True
+              for k, v in selector.items():
+                  if labels.get(k) != v:
+                      matched = False
+                      break
+
+              if not matched:
+                  continue
+
+              # セレクタでマッチした Pod へ SELECTOR エッジ
+              edges.add_edge_to_rid("spec.selector", rid, "SELECTOR")
+
+  #
+  # ExternalSecret
+  #
+  ExternalSecret/external-secrets.io/v1:
+    scope: Namespaced
+    custom_icon: $KD/icons/ExternalSecret.png
+    edges: |
+      # Edge to the secret store of this external secret
+      edges.add_edge_to(
+        "spec.secretStoreRef",
+        query_path(resource, "spec.secretStoreRef.name"),
+        get_namespace(resource),
+        query_path(resource, "spec.secretStoreRef.kind"),
+        query_path(resource, "apiVersion"),
+        "REFERENCE"
+      )
+      # Edge to the generated secret
+      edges.add_edge_to(
+        None,
+        get_name(resource),
+        get_namespace(resource),
+        "Secret",
+        "v1",
+        "OWNER"
+      )
+    nodes: |
+      # Create the secret for this external secret
+      nodes.append({
+        "kind": "Secret",
+        "apiVersion": "v1",
+        "metadata": {
+          "name": get_name(resource),
+          "namespace": get_namespace(resource),
+          "labels": query_path(resource, "metadata.labels"),
+          "annotations": query_path(resource, "metadata.annotations")
+        }
+      })
+  ExternalSecret/external-secrets.io/v1alpha1: ExternalSecret/external-secrets.io/v1
+  ExternalSecret/external-secrets.io/v1beta1: ExternalSecret/external-secrets.io/v1
+  SecretStore/external-secrets.io/v1:
+    scope: Namespaced
+    custom_icon: $KD/icons/SecretStore.png
+
+  #
+  # Argo
+  #
+  Application/argoproj.io/v1alpha1:
+    scope: Namespaced
+    custom_icon: $KD/icons/ArgoCDApplication.png
+    edges: |
+      # # spec.destination.namespace
+      # edges.add_edge_to(
+      #   "spec.destination.namespace",
+      #   ".",
+      #   None,
+      #   "Namespace",
+      #   "v1",
+      #   "REFERENCE"
+      # )
+      # spec.source
+      edges.add_edge_to(
+        "spec.source",
+        query_path(resource, "spec.source.repoURL"),
+        None,
+        "GitHub",
+        "v1",
+        "REFERENCE-UP"
+      )
+    nodes: |
+      # spec.source
+      nodes.append({
+        "apiVersion": "v1",
+        "kind": "GitHub",
+        "metadata": {
+          "name": query_path(resource, "spec.source.repoURL")
+        }
+      })
+  GitHub/v1:
+    scope: Outside
+    diagram_node_classname: diagrams.onprem.vcs.Github
